@@ -162,6 +162,81 @@ class PerlinNoise2D:
 
 
 # ============================================================
+# 公共形态工具：二值元胞自动机（边缘扰动 / 平滑）
+# ============================================================
+def ca_smooth_binary(mask: np.ndarray, iterations: int = 2,
+                     threshold: int = 5) -> np.ndarray:
+    """
+    洞穴生成式二值元胞自动机平滑（多数规则）。
+
+    每次迭代统计每个像素九格（八邻域 + 自身）中 True 的数量，
+    ≥ threshold 则置 True，否则置 False。迭代数次后边界圆润、
+    孤立噪点被消除、细碎缺口被填补。地图外视为 False。
+
+    Parameters
+    ----------
+    mask : (h, w) bool 数组。
+    iterations : 迭代次数（每次迭代每像素 9 次加法，O(K·N)）。
+    threshold : 九格多数阈值，1~9；默认 5（严格多数）。
+        调小 → 掩膜趋于扩张；调大 → 掩膜趋于收缩。
+
+    Returns
+    -------
+    (h, w) bool 新数组。
+    """
+    m = np.ascontiguousarray(mask.astype(np.int8))
+    for _ in range(max(int(iterations), 0)):
+        p = np.pad(m, 1, mode="constant")
+        cnt = (p[0:-2, 0:-2] + p[0:-2, 1:-1] + p[0:-2, 2:] +
+               p[1:-1, 0:-2] + m               + p[1:-1, 2:] +
+               p[2:,   0:-2] + p[2:,   1:-1] + p[2:,   2:])
+        m = (cnt >= threshold).astype(np.int8)
+    return m.astype(bool)
+
+
+def ca_edge_perturb(mask: np.ndarray, rng: Generator,
+                    noise_prob: float = 0.15,
+                    expand_zone: Optional[np.ndarray] = None,
+                    iterations: int = 3,
+                    threshold: int = 5,
+                    constrain: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    用元胞自动机扰动二值掩膜的边缘（替代噪声抖动边界）。
+
+    步骤：
+        1. 在 expand_zone（候选扩张区，None 时全域）内按
+           noise_prob 撒随机噪点，并入掩膜；
+        2. 运行 ca_smooth_binary 多数规则迭代——噪点在原掩膜
+           边缘团聚成有机的凸包/分叉，远离主体的碎点被消除；
+        3. constrain（如陆地掩膜）非 None 时把结果限制在其内。
+
+    渐近复杂度与噪声抖动同为 O(N)（K 次迭代 × 9 邻域计数，
+    仅常数因子略大）。
+
+    Parameters
+    ----------
+    mask : (h, w) bool 原掩膜。
+    rng : numpy.random.Generator（通常传 world.rng），不自行播种。
+    noise_prob : 噪点概率（0~1），越大边缘扰动越剧烈。
+    expand_zone : (h, w) bool，允许撒噪点的区域；None = 全域。
+    iterations / threshold : 见 ca_smooth_binary。
+    constrain : (h, w) bool，结果的允许范围；None = 不限制。
+
+    Returns
+    -------
+    (h, w) bool 新数组。
+    """
+    m = np.asarray(mask, dtype=bool)
+    if noise_prob > 0:
+        zone = np.ones_like(m) if expand_zone is None else np.asarray(expand_zone, dtype=bool)
+        m = m | (zone & (rng.random(m.shape) < float(noise_prob)))
+    m = ca_smooth_binary(m, iterations=iterations, threshold=threshold)
+    if constrain is not None:
+        m &= np.asarray(constrain, dtype=bool)
+    return m
+
+
+# ============================================================
 # 通用 DLA 生长引擎（扩散限制聚集）
 # ============================================================
 class DLAResult(NamedTuple):
@@ -522,11 +597,13 @@ class World:
         # 岩石硬度层：int16，整数，范围 0~255。越高越抗蚀。
         self._rock_hardness: np.ndarray = np.zeros((self.height, self.width), dtype=np.int16)
 
-        # 气压带层：int8。仅与纬度相关（地图顶部 = 90°N 北极，底部 = 0° 赤道）。
-        # 0 = 赤道低气压带
-        # 1 = 副热带高气压带
-        # 2 = 副极地低气压带
-        # 3 = 极地高气压带
+        # 气压带层：int8。仅与纬度相关（地图顶部 = 70°N，底部 = 0° 赤道）。
+        # 0 = 赤道低气压带（0~10°N）
+        # 1 = 信风带（10~25°N）
+        # 2 = 副热带高气压带（25~35°N）
+        # 3 = 地中海带（35~42°N）
+        # 4 = 西风带（42~55°N）
+        # 5 = 副极地低气压带（55~70°N）
         self._pressure_belt: np.ndarray = np.zeros((self.height, self.width), dtype=np.int8)
 
         # 湿度层：float32，范围 0~100。水体 = 100，
@@ -678,13 +755,15 @@ class World:
     @property
     def pressure_belt(self) -> np.ndarray:
         """
-        气压带图层，int8。仅与纬度相关（顶部 = 90°N，底部 = 0°）。
+        气压带图层，int8。仅与纬度相关（顶部 = 70°N，底部 = 0° 赤道）。
 
         编码：
-        0 = 赤道低气压带（宜居）
-        1 = 副热带高气压带
-        2 = 副极地低气压带（宜居）
-        3 = 极地高气压带
+        0 = 赤道低气压带（0~10°N）
+        1 = 信风带（10~25°N）
+        2 = 副热带高气压带（25~35°N）
+        3 = 地中海带（35~42°N）
+        4 = 西风带（42~55°N）
+        5 = 副极地低气压带（55~70°N）
         """
         return self._pressure_belt
 

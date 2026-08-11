@@ -1764,7 +1764,7 @@ def generate_mountain_terrain(
     ocean_expansion_prob: float = 0.2,   # 每轮邻洋大陆板块转为海洋的概率 [0~1]
     continent_base: float = 5.0,        # 大陆板块基准海拔(米)
     ocean_depth: float = 50.0,          # 海洋板块基准沉降深度(米)；应大于山脊抬升量级
-    domain_transition_sigma: float = 2.0,# 海陆基准场高斯平滑σ(格)；↑海岸过渡更宽 [0~15]
+    domain_transition_sigma: float = 4.0,# 海陆基准场高斯平滑σ(格)；↑海岸过渡更宽 [0~15]
     # ── 板块速度（方向随机，大小正态）──
     micro_speed_mean: float = 1.0,       # 小板块个体速度大小均值(速度单位)
     micro_speed_std: float = 0.2,        # 小板块个体速度大小标准差
