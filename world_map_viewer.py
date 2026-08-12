@@ -15,6 +15,9 @@ independent from the 3D viewer (world_viewer.py):
         * Deposition  - alluvial fans (yellow) / deltas (orange), blended
         * Mountains   - mountain_mask (DLA ridge-stamp coverage), blended red;
                         rivers currently terminate at its edge
+        * Outlets     - outlet scatter debug view: dilated coast band
+                        (scatter-available area, magenta tint) + seeded
+                        outlet points (bright magenta)
     - Single seed entry + "Generate" button (no console input).
 
 All UI text is English (target environment has no CJK font).
@@ -63,6 +66,11 @@ _DELTA_RGB = np.array([255, 112, 67], dtype=np.float64)
 _DEPOSITION_BLEND = 0.65    # 沉积区颜色与地形的混合比
 _MOUNTAIN_RGB = np.array([192, 57, 43], dtype=np.float64)
 _MOUNTAIN_BLEND = 0.55      # 山脉（DLA 梳齿纹样覆盖区）颜色与底色的混合比
+
+# Outlet scatter debug overlay
+_OUTLET_BAND_RGB = np.array([255, 64, 200], dtype=np.float64)
+_OUTLET_BAND_BLEND = 0.45   # 宽海岸带（撒点可用区）颜色与底色的混合比
+_OUTLET_RGB = np.array([255, 0, 255], dtype=np.float64)
 
 # Plates 板块视图：色相按大板块分组；鲜艳明亮 = 大陆板块，灰暗低沉 = 海洋板块
 _VELOCITY_ARROW_SCALE = 8.0   # 速度箭头长度（基础分辨率像素 / 速度单位）
@@ -203,6 +211,7 @@ def render_map_rgb(
     show_rivers: bool,
     show_deposition: bool,
     show_mountains: bool = True,
+    show_outlets: bool = False,
 ) -> np.ndarray:
     """Compose the final map as a (h, w, 3) uint8 array."""
     if color_mode == "Elevation":
@@ -242,6 +251,17 @@ def render_map_rgb(
     if show_rivers:
         rgb[world.river_mask] = _RIVER_RGB
 
+    if show_outlets:
+        # 河口撒点调试：宽海岸带（可用撒点区）半透明品红，
+        # 成功播撒的入海口实心亮品红（压在河流之上，便于核对）
+        band = world.get_layer("outlet_band")
+        if band is not None and np.any(band):
+            rgb[band] = (rgb[band] * (1.0 - _OUTLET_BAND_BLEND)
+                         + _OUTLET_BAND_RGB * _OUTLET_BAND_BLEND)
+        outlet = world.get_layer("outlet_mask")
+        if outlet is not None and np.any(outlet):
+            rgb[outlet] = _OUTLET_RGB
+
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
@@ -262,6 +282,7 @@ class WorldMapApp(tk.Tk):
         self.show_rivers = tk.BooleanVar(value=True)
         self.show_deposition = tk.BooleanVar(value=True)
         self.show_mountains = tk.BooleanVar(value=True)
+        self.show_outlets = tk.BooleanVar(value=False)
         self.seed_var = tk.StringVar(value=str(DEFAULT_SEED))
         self.status_var = tk.StringVar(value="Ready.")
 
@@ -304,6 +325,9 @@ class WorldMapApp(tk.Tk):
         ttk.Checkbutton(overlay_frame, text="Mountains (DLA ridges)",
                         variable=self.show_mountains,
                         command=self._redraw).pack(anchor=tk.W)
+        ttk.Checkbutton(overlay_frame, text="Outlet scatter (band + seeds)",
+                        variable=self.show_outlets,
+                        command=self._redraw).pack(anchor=tk.W)
 
         legend = ttk.LabelFrame(panel, text="Legend", padding=6)
         legend.pack(fill=tk.X, pady=4)
@@ -311,6 +335,8 @@ class WorldMapApp(tk.Tk):
         ttk.Label(legend, text="Yellow : alluvial fans", foreground="#b8960f").pack(anchor=tk.W)
         ttk.Label(legend, text="Orange : deltas", foreground="#c55a11").pack(anchor=tk.W)
         ttk.Label(legend, text="Red    : mountains (ridges)", foreground="#c0392b").pack(anchor=tk.W)
+        ttk.Label(legend, text="Pink   : outlet scatter band", foreground="#d030a0").pack(anchor=tk.W)
+        ttk.Label(legend, text="Magenta: seeded outlets", foreground="#c000c0").pack(anchor=tk.W)
         ttk.Separator(legend, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
         ttk.Label(legend, text="Plates mode:").pack(anchor=tk.W)
         ttk.Label(legend, text="  hue group  = macro plate").pack(anchor=tk.W)
@@ -351,8 +377,13 @@ class WorldMapApp(tk.Tk):
         self.world, report = result
         self.gen_button.config(state=tk.NORMAL)
         rivers = report.get("rivers", {})
+        band = self.world.get_layer("outlet_band")
+        outlet = self.world.get_layer("outlet_mask")
+        n_band = int(band.sum()) if band is not None else 0
+        n_outlet = int(outlet.sum()) if outlet is not None else 0
         self.status_var.set(
             f"seed={seed} | sea level {self.world.sea_level:.0f} m | "
+            f"outlets {n_outlet}/{NUM_OUTLETS} (band {n_band}) | "
             f"river cells {rivers.get('river_cells', 0)} | "
             f"fans {report['river_erosion']['num_fans']} | "
             f"deltas {report['river_erosion']['num_deltas']}"
@@ -369,6 +400,7 @@ class WorldMapApp(tk.Tk):
             show_rivers=self.show_rivers.get(),
             show_deposition=self.show_deposition.get(),
             show_mountains=self.show_mountains.get(),
+            show_outlets=self.show_outlets.get(),
         )
         img = Image.fromarray(rgb, mode="RGB")
         if DISPLAY_SCALE > 1:

@@ -13,7 +13,8 @@ world_core.py
     2. 新增 sea_level 属性（海平面），由海拔/水文模块统一读写。
     3. 水文与侵蚀模块的图层正式化为一等公民：
        rock_hardness / pressure_belt / humidity / river_mask /
-       river_strength / deposition_type / deposition_thickness。
+       river_strength / river_discharge / deposition_type /
+       deposition_thickness。
     4. 通用 DLA 生长引擎 grow_dla 与噪声并列，供河流、山脉等
        多个模块共用（投放范围/投放倾向/运动倾向/附着可行域均为参数）。
     5. 板块速度碰撞大修：新增海陆板块划分层 plate_domain、山脊线
@@ -617,6 +618,11 @@ class World:
         # 离入海口越近数值越大，源头为 1。
         self._river_strength: np.ndarray = np.zeros((self.height, self.width), dtype=np.float32)
 
+        # 河流水流量层：float32。源头注入水流量（基础 + 湿润地区加成 +
+        # 临近高山加成）并向下游累加，每个河道格有自己的水流量值，
+        # 离入海口越近越大。
+        self._river_discharge: np.ndarray = np.zeros((self.height, self.width), dtype=np.float32)
+
         # 沉积类型层：int8。
         # 0 = 无沉积
         # 1 = 山前/盆地冲积扇
@@ -781,6 +787,11 @@ class World:
     def river_strength(self) -> np.ndarray:
         """河流强度图层，float32。上游汇流计数，离入海口越近越大。"""
         return self._river_strength
+
+    @property
+    def river_discharge(self) -> np.ndarray:
+        """河流水流量图层，float32。源头注入（含湿润/临高山加成）向下游累加，离入海口越近越大。"""
+        return self._river_discharge
 
     @property
     def deposition_type(self) -> np.ndarray:

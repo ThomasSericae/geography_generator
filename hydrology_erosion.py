@@ -18,11 +18,15 @@ hydrology_erosion.py
     4.  湿度图层（四级：全湿润/半湿润/半干旱/干旱，水体完全
         湿润、陆地默认干旱。气候带给基底，海岸带（距离变换+
         元胞自动机扰动边缘）、山脉雨影（靠海侧多升、靠内陆
-        侧少升）、西风（自西缘衰减，地中海带受小西风）与
+        侧少升）、西风（自西缘纬度45°N源点向东南北扩散的
+        拉长椭圆风场，向东衰减慢、北向衰减快、南向探入地
+        中海带西部，地中海带受小西风）与
         季风（东南→西北线性风，不作用于赤道低压带，区内
         最差半干旱）提供
         增益；带边界经元胞自动机扰动呈有机曲线；最后强制
-        相邻区域等级差≤1，缺失中间等级自动补带）
+        相邻区域等级差≤1，缺失中间等级自动补带；信风带与
+        副热带高压带终检剔除海洋带来的升湿，带际过渡与
+        季风带来的半湿润/湿润保留）
     5.  河流生成（默认空间殖民算法 SCA 简化版：非山脉陆地随机散布
         吸引点、裂谷加撒吸引点使其有较大机会成为河道、
         海岸河口放置根节点，纯吸引方向生长，河道平直；
@@ -31,9 +35,11 @@ hydrology_erosion.py
         mountain_mask 图层，河流暂时终止于其边缘；海岸线有
         河流规避距离（近岸不撒点、带内只许奔向本树河口）；
         吸引点按湿度加权（干旱不撒、半干旱稀化），河网密度
-        随湿度变化；河口沿整条海岸线弧长均匀撒点；
+        随湿度变化；河口在几格宽的宽海岸带内随机撒点；
         可选旧版 DLA 算法。
-        流量 = 上游汇流计数，离入海口越近越大）
+        流量 = 上游汇流计数，离入海口越近越大；水流量单独
+        成层 river_discharge——源头注入基础流量，湿润/临高山
+        源头有加成，向下游累加，每个河道格有自己的水流量值）
     6.  水力侵蚀（湿度 × 坡度 × 可蚀性，部分向邻域再沉积）
     7.  风力侵蚀（干燥度 × 可蚀性，磨蚀降低海拔）
     8.  河流侵蚀与沉积（河流功率定律下切；
@@ -51,7 +57,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.ndimage import (
-    binary_dilation, distance_transform_edt, gaussian_filter, label,
+    binary_dilation, distance_transform_edt, gaussian_filter,
     uniform_filter,
 )
 from scipy.spatial import cKDTree
@@ -321,6 +327,62 @@ def _wind_gradient_ca(
     return f
 
 
+def _elliptical_gradient_ca(
+    proj: np.ndarray,
+    source_y: float,
+    edge_zone: float,
+    noise_prob: float,
+    iterations: int,
+    rng,
+) -> np.ndarray:
+    """
+    点源各向异性（拉长椭圆）风基础强度场（0~1，未加 falloff
+    指数），截止线经元胞自动机扰动（world_core.ca_edge_perturb）
+    而不再是一条光滑曲线。
+
+    proj : 以风源（屏幕左缘 source_y 行）为原点的椭圆归一化
+        距离场（风源处 = 0，等值线为东西拉长的椭圆，光滑截止于
+        proj = 1）。
+    source_y : 风源所在行号（纬度 45°N）。
+    edge_zone / noise_prob / iterations : 截止线 CA 扰动参数
+        （扰动范围（proj 单位，由格数按椭圆平均半轴折算）/
+        噪点概率 / 平滑迭代）；任一 ≤0 时退回光滑椭圆截止。
+
+    做法：光滑椭圆截止区域 proj ≤ 1 的边缘条带内撒噪点、多数
+    规则平滑，得到有机边界；再把扰动后区域按自风源出发的方位角
+    分桶，取每个方向上的最大投影作为该方向的有效截止，强度自
+    风源向有效截止线性衰减——凸出的舌状区域同样获得完整梯度，
+    咬入的缺口则截断其外侧。
+    """
+    if edge_zone > 0 and noise_prob > 0:
+        region = proj <= 1.0
+        zone = np.abs(proj - 1.0) <= float(edge_zone)
+        region = ca_edge_perturb(region, rng, noise_prob=noise_prob,
+                                 expand_zone=zone,
+                                 iterations=int(iterations))
+        h, w = proj.shape
+        yv, xv = np.mgrid[0:h, 0:w]
+        nbins = 720
+        ang = np.arctan2(yv - float(source_y), xv.astype(np.float64))
+        bin_idx = np.clip(((ang + math.pi) / (2.0 * math.pi) * nbins)
+                          .astype(np.int64), 0, nbins - 1)
+        reach_bin = np.zeros(nbins)
+        np.maximum.at(reach_bin, bin_idx[region], proj[region])
+        # 填补空桶：只向内插值填缺口、不向两端外推，
+        # 避免梯度被涂抹到区域未覆盖的方向上
+        nz = reach_bin > 0
+        if nz.any() and not nz.all():
+            idx = np.arange(nbins)
+            first, last = int(idx[nz][0]), int(idx[nz][-1])
+            gap = (~nz) & (idx > first) & (idx < last)
+            reach_bin[gap] = np.interp(idx[gap], idx[nz], reach_bin[nz])
+        bm = reach_bin[bin_idx]
+    else:
+        bm = np.ones_like(proj)
+    bm = np.maximum(bm, 1e-6)
+    return np.clip(1.0 - proj / bm, 0.0, 1.0)
+
+
 def _compute_humidity(
     world: World,
     coastal_humidity_width: float,
@@ -334,6 +396,9 @@ def _compute_humidity(
     westerly_reach_frac: float,
     westerly_boost: float,
     westerly_falloff: float,
+    westerly_source_lat: float,
+    westerly_lat_ratio: float,
+    westerly_south_ratio: float,
     mediterranean_westerly_boost: float,
     westerlies_min_level: int,
     monsoon_reach_frac: float,
@@ -362,14 +427,19 @@ def _compute_humidity(
            更近（靠海一侧）加 mountain_sea_boost，更远（靠内陆
            一侧）加 mountain_inland_boost，作用范围
            mountain_effect_radius；
-        4. 西风（含地中海"小西风"）：按到地图西缘的距离衰减
-           加成（范围 westerly_reach_frac × 图宽，衰减指数
-           westerly_falloff：<1 衰减放缓、湿润深入内陆）——
-           西风带全额 westerly_boost，地中海带较弱的
-           mediterranean_westerly_boost；截止线经元胞自动机
-           扰动（wind_edge_*，见 _wind_gradient_ca），不再是
-           直线；西风带最低湿度钳制为 westerlies_min_level
-           （默认半干旱）；
+        4. 西风（含地中海"小西风"）：自屏幕左缘纬度
+           westerly_source_lat（默认 45°N，西风带中部）的源点
+           向东南北三个方向扩散的拉长椭圆风场——东西向半轴 =
+           westerly_reach_frac × 图宽（向东衰减慢）；纵向分南北
+           两个半轴：北向 = 东西向半轴 × westerly_lat_ratio，
+           南向 = 东西向半轴 × westerly_south_ratio（默认更大，
+           使西风南缘探入地中海带西部，地中海带因此能实际受到
+           "小西风"加成）；衰减指数 westerly_falloff（<1 衰减
+           放缓、湿润深入内陆）。西风带全额 westerly_boost，
+           地中海带较弱的 mediterranean_westerly_boost；椭圆
+           截止线经元胞自动机扰动（wind_edge_*，见
+           _elliptical_gradient_ca），不再是光滑曲线；西风带最低
+           湿度钳制为 westerlies_min_level（默认半干旱）；
         5. 季风（东南→西北线性风，与西风同构；不作用于赤道
            低压带）：沿风向的投影距离（距东缘与距南缘的平均，
            东南角为 0）线性衰减，范围 monsoon_reach_frac ×
@@ -382,7 +452,12 @@ def _compute_humidity(
            干旱）；海岸与地形增益照常叠加；
         6. 相邻过渡强制（_enforce_adjacent_levels）：任意相邻
            像素等级差 ≤ 1，缺失的中间等级自动补带（水体参与，
-           海岸因此总有 全湿润→半湿润→半干旱 的过渡环）。
+           海岸因此总有 全湿润→半湿润→半干旱 的过渡环）；
+        7. 信风带与副热带高压带终检：临近海洋不得把两带抬过
+           半干旱——海岸增益已被增益表限制，水体经过渡强制投出
+           的湿润过渡环则另跑一遍"水体按半干旱计"的过渡强制并
+           取两版较低者予以剔除；气候带过渡（如地中海带旁的
+           半湿润过渡带）与季风带来的升湿不受影响。
     """
     h, w = world.shape
     land = world.land_mask
@@ -426,12 +501,28 @@ def _compute_humidity(
             sea_side, float(mountain_sea_boost),
             float(mountain_inland_boost))[within]
 
-    # ---- 4. 西风（自西缘向东线性衰减，截止线经元胞自动机扰动）----
+    # ---- 4. 西风（自左缘纬度 45°N 源点向东南北扩散的拉长椭圆
+    # 风场，截止线经元胞自动机扰动）----
+    # 等值线为以源点（屏幕左缘、纬度 westerly_source_lat，即西风带
+    # 中部）为端点的东西拉长椭圆：向东衰减慢（东西向半轴 =
+    # westerly_reach_frac × 图宽），纵向衰减快。纵向分南北两个
+    # 半轴：北向半轴 = 东西向半轴 × westerly_lat_ratio，南向半轴 =
+    # 东西向半轴 × westerly_south_ratio（更大，使西风南缘探入
+    # 地中海带西部）。
     # 西风带全额加成，地中海带另受较弱的"小西风"加成（同一风场）
-    reach_west = max(float(westerly_reach_frac) * w, 1e-6)
-    f_west = _wind_gradient_ca(
-        xv.astype(np.float64), reach_west, 1,
-        wind_edge_zone_width, wind_edge_noise_prob, wind_edge_iterations,
+    y0_west = (1.0 - float(westerly_source_lat) / _MAP_TOP_LAT) * (h - 1)
+    a_west = max(float(westerly_reach_frac) * w, 1e-6)      # 东西向半轴（长轴）
+    b_north = max(a_west * float(westerly_lat_ratio), 1e-6)   # 北向半轴
+    b_south = max(a_west * float(westerly_south_ratio), 1e-6)  # 南向半轴
+    dy_west = yv.astype(np.float64) - y0_west  # >0 = 源点以南（低纬）
+    b_west = np.where(dy_west > 0, b_south, b_north)
+    proj_west = np.sqrt((xv.astype(np.float64) / a_west) ** 2
+                        + (dy_west / b_west) ** 2)
+    f_west = _elliptical_gradient_ca(
+        proj_west, y0_west,
+        float(wind_edge_zone_width)
+        / (0.5 * (a_west + 0.5 * (b_north + b_south))),
+        wind_edge_noise_prob, wind_edge_iterations,
         world.rng) ** float(westerly_falloff)
     westerly_extra = np.where(belts == _BELT_WESTERLIES,
                               float(westerly_boost) * f_west, 0.0)
@@ -469,9 +560,26 @@ def _compute_humidity(
         wmask = land & (belts == _BELT_WESTERLIES)
         level[wmask] = np.maximum(level[wmask], int(westerlies_min_level))
     level[water] = 3  # 水体完全湿润
+    level_pre = level.copy()  # 过渡强制前的等级（供步骤 7 使用）
 
     # ---- 6. 相邻等级过渡强制（缺失的中间等级自动补带）----
     level = _enforce_adjacent_levels(level, transition_band)
+
+    # ---- 7. 信风带/副热带高压带终检：临近海洋不得造就半湿润/
+    # 湿润，但气候带过渡与季风可以 ----
+    # 海岸增益本身已被增益表限制在两带 ≤ 半干旱；还需剔除的是
+    # 水体经过渡强制投出的湿润过渡环。做法：另跑一遍"水体按
+    # 半干旱（1）计"的过渡强制——该版本中水体不再抬升两带，
+    # 而陆地气候带（如地中海带）的带际过渡与季风等级不受影响；
+    # 两带取两版结果的较低者
+    dry_belts = land & ((belts == _BELT_TRADE)
+                        | (belts == _BELT_SUBTROPICAL_HIGH))
+    if dry_belts.any():
+        level_alt = level_pre.copy()
+        level_alt[water] = 1
+        level_alt = _enforce_adjacent_levels(level_alt, transition_band)
+        level[dry_belts] = np.minimum(level[dry_belts],
+                                      level_alt[dry_belts])
 
     # ---- 等级 → 代表值写入 ----
     values = np.asarray(_HUMIDITY_LEVEL_VALUES, dtype=np.float64)
@@ -496,117 +604,67 @@ def _compute_humidity(
     return report
 
 
-# 八邻域偏移（海岸走查用）
-_D8_POS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1),
-           (1, -1), (1, 0), (1, 1))
-
-
 # ============================================================
-# 功能函数 5 内部工具：河口播种（最小间距拒绝抽样）
+# 功能函数 5 内部工具：河口播种（宽海岸带内随机撒点）
 # ============================================================
 def _select_outlets(
     world: World,
     water: np.ndarray,
     num_outlets: int,
     outlet_coast_spacing: Optional[float] = None,
+    outlet_coast_band: float = 3.0,
 ) -> List[Tuple[int, int]]:
     """
-    河口种子：先检查整条海岸线，再沿海岸线弧长均匀撒点。
+    河口种子：宽海岸带内随机撒点（替代旧版"连通域走查 + 弧长
+    均分"——弧长对海岸曲折度过于敏感，峡湾海岸会吞掉大量配额，
+    平直肥沃的海岸反而分不到河口）。
 
     步骤：
-        1. 海岸线 = 与水相邻的陆地像素（8 邻域），按 8 连通
-           分解为连通域（大陆沿岸、岛屿沿岸各自成域）；
-        2. 每个连通域内做贪心沿程走查，得到海岸线的 1D 弧长
-           坐标：起点取邻居最少的端点状像素，每步走向"未访问
-           邻居数最少"的未访问邻居（避免先走进死胡同）；走查
-           卡死时跳到本域最近的未访问格继续（海岸带局部较宽
-           的叉路，跳跃不计弧长）；
-        3. 全图海岸线总长 L_tot。outlet_coast_spacing 为
-           None/≤0：间距 = L_tot / num_outlets（把 num_outlets
-           个河口均分在整条海岸线上）；否则间距 =
-           max(给定值, L_tot / num_outlets)（间距不小于给定值，
-           且总数不超过 num_outlets）；
-        4. 目标位置取每段中点 (k+0.5)×spacing，按全局弧长
-           映射回所在连通域的走查位置，取对应海岸格。
+        1. 海岸线 = 与水相邻的陆地像素（8 邻域）；
+        2. 膨胀 outlet_coast_band 格形成几格宽的宽海岸带，并限制
+           在陆地上（河口根必须在陆侧）；≤0 时退化为 1 格宽海岸线；
+        3. 在带内无放回随机抽点：均分模式（outlet_coast_spacing
+           为 None/≤0）抽取 num_outlets 个；间距模式（数值）以
+           原始海岸线格数近似海岸弧长，抽取数 ≈ 弧长/间距
+           （仍不超过 num_outlets）；带内格数不足时全取；
+        4. 纯随机撒点——只要点够多，总有落在理想位置的河口候选；
+           每条海岸、每段岸线都按面积等概率获得根节点。
     """
     land = world.land_mask
     coast = land & binary_dilation(water)
+    # 可观测性：把撒点可用区域与最终入海口写入自定义图层，
+    # 供地图查看器叠加显示（即使提前返回也保证图层存在）
+    if world.get_layer("outlet_band") is None:
+        world.add_layer("outlet_band", np.bool_, False)
+    if world.get_layer("outlet_mask") is None:
+        world.add_layer("outlet_mask", np.bool_, False)
+    band_layer = world.get_layer("outlet_band")
+    mask_layer = world.get_layer("outlet_mask")
+    band_layer[...] = False
+    mask_layer[...] = False
     if not coast.any() or num_outlets <= 0:
         return []
-
-    # ---- 1. 8 连通海岸连通域 ----
-    lbl, ncomp = label(coast, structure=np.ones((3, 3), dtype=np.int8))
-    ys, xs = np.nonzero(coast)
-    comp_cells: Dict[int, List[Tuple[int, int]]] = {}
-    for y, x in zip(ys, xs):
-        comp_cells.setdefault(int(lbl[y, x]), []).append((int(y), int(x)))
-
-    # ---- 2. 每域贪心沿程走查 + 累计弧长 ----
-    def walk(cells: List[Tuple[int, int]]):
-        cell_set = set(cells)
-        nbs_of = {
-            c: [n for n in
-                ((c[0] + dy, c[1] + dx) for dy, dx in _D8_POS)
-                if n in cell_set]
-            for c in cells
-        }
-        start = min(cells, key=lambda c: len(nbs_of[c]))  # 端点状像素
-        order = [start]
-        cum = [0.0]
-        visited = {start}
-        cur = start
-        while len(visited) < len(cells):
-            cands = [n for n in nbs_of[cur] if n not in visited]
-            if cands:
-                nxt = min(cands, key=lambda n: sum(
-                    1 for q in nbs_of[n] if q not in visited))
-                cum.append(cum[-1] + math.hypot(nxt[0] - cur[0],
-                                                nxt[1] - cur[1]))
-            else:
-                # 卡死（宽海岸带叉路）：跳到本域最近未访问格，不计弧长
-                rest = [c for c in cells if c not in visited]
-                nxt = min(rest, key=lambda c: (c[0] - cur[0]) ** 2
-                          + (c[1] - cur[1]) ** 2)
-                cum.append(cum[-1])
-            cur = nxt
-            order.append(cur)
-            visited.add(cur)
-        return order, np.asarray(cum)
-
-    walks = [walk(c) for c in comp_cells.values()]
-    total_cells = sum(len(o) for o, _ in walks)
-    L_tot = float(sum(c[-1] for _, c in walks))
-    if L_tot <= 0 or total_cells == 0:
-        # 退化情形（海岸线全是孤立格）：直接顺序取格
-        flat = [c for o, _ in walks for c in o]
-        return flat[:int(num_outlets)]
-
-    # ---- 3. 间距与目标位置 ----
-    if outlet_coast_spacing is None or outlet_coast_spacing <= 0:
-        n = max(1, min(int(num_outlets), total_cells))
-        spacing = L_tot / n
+    if outlet_coast_band > 0:
+        band = binary_dilation(coast, iterations=int(outlet_coast_band)) & land
     else:
-        spacing = max(float(outlet_coast_spacing),
-                      L_tot / max(int(num_outlets), 1))
-        n = max(1, int(L_tot / spacing))
-
-    # ---- 4. 段中点目标 → 映射回海岸格 ----
-    offsets = np.concatenate(
-        [[0.0], np.cumsum([float(c[-1]) for _, c in walks])])
-    result: List[Tuple[int, int]] = []
-    seen = set()
-    for k in range(n):
-        t = (k + 0.5) * spacing
-        ci = int(np.searchsorted(offsets, t, side="right")) - 1
-        ci = min(max(ci, 0), len(walks) - 1)
-        order, cum = walks[ci]
-        idx = min(int(np.searchsorted(cum, t - offsets[ci])),
-                  len(order) - 1)
-        cell = order[idx]
-        if cell not in seen:
-            seen.add(cell)
-            result.append(cell)
-    return result
+        band = coast
+    band_layer[...] = band
+    cells = np.argwhere(band)
+    if len(cells) == 0:
+        return []
+    if outlet_coast_spacing is not None and outlet_coast_spacing > 0:
+        # 间距模式：原始海岸格数 ≈ 海岸弧长，推出目标数量
+        approx_len = float(coast.sum())
+        n = max(1, min(int(num_outlets),
+                       int(approx_len / float(outlet_coast_spacing))))
+    else:
+        n = int(num_outlets)
+    n = min(n, len(cells))
+    pick = world.rng.choice(len(cells), size=n, replace=False)
+    outlets = [(int(cells[i, 0]), int(cells[i, 1])) for i in pick]
+    for y, x in outlets:
+        mask_layer[y, x] = True
+    return outlets
 
 
 
@@ -664,6 +722,7 @@ def _grow_rivers_dla(
     world: World,
     num_outlets: int,
     outlet_coast_spacing: Optional[float],
+    outlet_coast_band: float,
     spawn_radius: float,
     spawn_elevation_bias: float,
     walk_elevation_bias: float,
@@ -676,7 +735,7 @@ def _grow_rivers_dla(
     """
     DLA（扩散限制聚集）河流生成。
 
-    河流特有逻辑留在本函数：海岸线河口播种（最小间距拒绝抽样）、
+    河流特有逻辑留在本函数：海岸线河口播种（宽海岸带内随机撒点）、
     可行域构造（陆地，可选扣除 coastal_buffer 近水带）、
     流量累加（附着逆序一趟，离入海口越近越大）。
     生长机制本身（投放池、投放/运动倾向、附着可行域控制）
@@ -699,7 +758,8 @@ def _grow_rivers_dla(
     feasible = world.land_mask & ~near_water
 
     # ---- 1. 河口播种 ----
-    outlets = _select_outlets(world, water, num_outlets, outlet_coast_spacing)
+    outlets = _select_outlets(world, water, num_outlets,
+                              outlet_coast_spacing, outlet_coast_band)
 
     # ---- 2. 通用 DLA 生长 ----
     result = grow_dla(
@@ -726,9 +786,9 @@ def _grow_rivers_dla(
     world.river_strength[...] = strength.astype(np.float32)
 
     stats = dict(result.stats)
-    stats["outlet_mode"] = ("coast_uniform"
+    stats["outlet_mode"] = ("band_random"
                             if not (outlet_coast_spacing and outlet_coast_spacing > 0)
-                            else "coast_spacing")
+                            else "band_random_spacing")
     stats["num_outlets"] = len(outlets)
     stats["river_cells"] = len(attach_log)
     if attach_log:
@@ -747,6 +807,7 @@ def _grow_rivers_sca(
     world: World,
     num_outlets: int,
     outlet_coast_spacing: Optional[float],
+    outlet_coast_band: float,
     num_attraction: int,
     d_i: float,
     d_k: float,
@@ -763,6 +824,8 @@ def _grow_rivers_sca(
     semi_arid_attraction_frac: float,
     rift_attraction: int,
     node_retries: int,
+    young_influence: float,
+    young_steps: int,
     max_iterations: int,
 ) -> Tuple[Dict[str, Any], List[Tuple[int, int, int, int]]]:
     """
@@ -775,10 +838,9 @@ def _grow_rivers_sca(
         （plate_boundaries == 5；fallback ridge_id < 0）上加撒
         rift_attraction 个吸引点——裂谷是板块离散形成的构造低地，
         加撒吸引点把河网拉进裂谷，使其有较大机会成为河道；
-        海岸线河口放置根节点（每条河一个：先检查整条海岸线，
-        按连通域走查成 1D 曲线后沿海岸弧长均匀撒点，见
-        _select_outlets；共享同一吸引点场 → 河流自然争夺流域、
-        互不交叉）。
+        海岸线河口放置根节点（每条河一个：在几格宽的宽海岸带内
+        随机撒点，见 _select_outlets；共享同一吸引点场 → 河流
+        自然争夺流域、互不交叉）。
         迭代：
             1. 关联：每个活跃吸引点 m 找到距离最近的节点 n，
                若 distance(m, n) < d_i 则加入 S(n)；
@@ -812,6 +874,11 @@ def _grow_rivers_sca(
           本树河口（或尚在河口半径内）"时允许——只允许奔向自己
           的入海口或向内陆穿越，不允许沿河岸平行游走（与山脉的
           mountain_buffer 外扩禁入相对称）；0 = 关闭；
+        · 幼龄豁免：深度（离河口的步数）≤ young_steps 的节点，
+          吸引点影响半径放宽为 d_i × young_influence——刚离开
+          河口的河段尚在近岸无点带内，普通半径内没有吸引点会
+          直接夭折；放宽后能捕获内陆吸引点、撑过无点带。
+          young_steps ≤ 0 或 young_influence ≤ 1 = 关闭；
         · 湿度加权吸引点：河网密度 ∝ 湿度——干旱区按
           arid_attraction_frac（默认 0 = 不撒点）、半干旱区按
           semi_arid_attraction_frac（默认 0.3）稀化吸引点，
@@ -964,13 +1031,15 @@ def _grow_rivers_sca(
                         killed += 1
         return killed
 
-    # ---- 2. 初始化：河口根节点 N（全海岸线弧长均匀撒点）----
-    outlets = _select_outlets(world, water, num_outlets, outlet_coast_spacing)
+    # ---- 2. 初始化：河口根节点 N（宽海岸带内随机撒点）----
+    outlets = _select_outlets(world, water, num_outlets,
+                              outlet_coast_spacing, outlet_coast_band)
     pos_y: List[float] = []         # 浮点位置（生长运动学）
     pos_x: List[float] = []
     pix_y: List[int] = []           # 占据的像素格（海拔约束/避让/光栅化）
     pix_x: List[int] = []
     parent: List[int] = []          # 父节点索引，-1 = 根
+    depth: List[int] = []           # 距本树河口的步数（幼龄豁免用）
     root_py: List[int] = []         # 本节点所属树的河口像素（海岸规避用）
     root_px: List[int] = []
     children: List[List[int]] = []
@@ -1043,6 +1112,7 @@ def _grow_rivers_sca(
         pix_y.append(oy)
         pix_x.append(ox)
         parent.append(-1)
+        depth.append(0)
         root_py.append(oy)
         root_px.append(ox)
         children.append([])
@@ -1054,6 +1124,7 @@ def _grow_rivers_sca(
         kill_around(float(oy), float(ox))
 
     total_killed = int(n_att - att_active.sum())
+    young_assoc = 0               # 豁免关联救活的吸引点累计
     growth_rejected = 0
     spacing_stopped = 0
     reject_causes = [0, 0, 0, 0, 0, 0]  # 越界/下水/进山/下坡/碰撞/海岸规避
@@ -1080,10 +1151,36 @@ def _grow_rivers_sca(
         tree = cKDTree(np.column_stack((fy_arr, fx_arr)))
         coords = np.column_stack((att_y[active_idx], att_x[active_idx]))
         dist, tidx = tree.query(coords, k=1, distance_upper_bound=float(d_i))
-        S: Dict[int, List[int]] = {}
+        # assoc: 吸引点 -> (距离, 节点)；普通半径关联先入册
+        assoc: Dict[int, Tuple[float, int]] = {}
         for ai, d, ti in zip(active_idx, dist, tidx):
             if ti < len(front) and d <= float(d_i):
-                S.setdefault(front[int(ti)], []).append(int(ai))
+                assoc[int(ai)] = (float(d), front[int(ti)])
+        # 幼龄豁免：深度 ≤ young_steps 的前沿节点单独建树，
+        # 用放宽后的半径再查一遍；仅在"原本无关联、或豁免关联
+        # 更近"时改挂到幼龄节点名下（统计豁免救活的吸引点数）
+        young_d_i = float(d_i) * float(young_influence)
+        if young_influence > 1.0 and young_steps > 0 and young_d_i > float(d_i):
+            young_pos = [k for k, i in enumerate(front)
+                         if depth[i] <= young_steps]
+            if young_pos:
+                ytree = cKDTree(np.column_stack(
+                    (fy_arr[young_pos], fx_arr[young_pos])))
+                yd, yti = ytree.query(coords, k=1,
+                                      distance_upper_bound=young_d_i)
+                for ai, d, ti in zip(active_idx, yd, yti):
+                    if ti >= len(young_pos):
+                        continue
+                    node_idx = front[young_pos[int(ti)]]
+                    prev = assoc.get(int(ai))
+                    if prev is None:
+                        assoc[int(ai)] = (float(d), node_idx)
+                        young_assoc += 1
+                    elif float(d) < prev[0] and prev[1] != node_idx:
+                        assoc[int(ai)] = (float(d), node_idx)
+        S: Dict[int, List[int]] = {}
+        for ai, (_d, ni) in assoc.items():
+            S.setdefault(ni, []).append(ai)
 
         # 3.2 生长（纯吸引方向，新格直接取整落格，无候选择优）
         grew: List[int] = []
@@ -1143,6 +1240,7 @@ def _grow_rivers_sca(
                 pix_y.append(qy)
                 pix_x.append(qx)
                 parent.append(n_idx)
+                depth.append(depth[n_idx] + 1)
                 root_py.append(root_py[n_idx])
                 root_px.append(root_px[n_idx])
                 children.append([])
@@ -1241,9 +1339,9 @@ def _grow_rivers_sca(
 
     stats: Dict[str, Any] = {
         "algorithm": "sca",
-        "outlet_mode": ("coast_uniform"
+        "outlet_mode": ("band_random"
                         if not (outlet_coast_spacing and outlet_coast_spacing > 0)
-                        else "coast_spacing"),
+                        else "band_random_spacing"),
         "num_outlets": len(outlets),
         "mountain_cells": int(mountain.sum()),
         "river_land_cells": int(river_land.sum()),
@@ -1261,6 +1359,7 @@ def _grow_rivers_sca(
             if not terminated[i] and retries[i] >= node_retries
         )),
         "branches_spacing_stopped": spacing_stopped,
+        "young_rescued_attractions": young_assoc,
         "pruned_branches": pruned_branches,
         "attraction_scatter_by_level": att_by_level,
         "attraction_kept_by_level": att_kept_by_level,
@@ -1279,6 +1378,96 @@ def _grow_rivers_sca(
         "max_strength": float(strength.max()) if attach_log else 0.0,
     }
     return stats, attach_log
+
+
+# ============================================================
+# 功能函数 5b：河流水流量（源头注入 + 向下游累加）
+# ============================================================
+def _compute_river_discharge(
+    world: World,
+    attach_log: List[Tuple[int, int, int, int]],
+    mountain_min_elev: float,
+    source_flow: float,
+    humid_source_flow: float,
+    mountain_source_flow: float,
+    mountain_radius: float,
+) -> Dict[str, Any]:
+    """
+    河流水流量图层（world.river_discharge，float32）。
+
+    源头（无上游子格的河道末梢，不含河口根）注入水流量：
+        注入量 = source_flow（基础，每个源头都有）
+               + humid_source_flow（源头位于半湿润/全湿润地区时）
+               + mountain_source_flow × (1 − 到最近山体的距离
+                 / mountain_radius) ×（该山体海拔 / 全图山体最高海拔）
+                 （源头 mountain_radius 格内有海拔 ≥ mountain_min_elev
+                 的山体时；越近、山体越高，加成越大）
+    水流量自源头向下游累加（附着逆序 = 上游→下游拓扑序），每个
+    河道格的水流量 = 其全部上游源头注入量之和——源头越多、源头
+    越湿润、源头越近高山，水流量越大，离入海口越近越大。
+    非河道格为 0。
+    """
+    h, w = world.shape
+    stats: Dict[str, Any] = {
+        "num_sources": 0,
+        "humid_sources": 0,
+        "mountain_sources": 0,
+        "max_discharge": 0.0,
+        "mean_discharge": 0.0,
+    }
+    discharge = np.zeros((h, w), dtype=np.float64)
+    if not attach_log:
+        world.river_discharge[...] = 0.0
+        return stats
+
+    # ---- 1. 源头 = 不作为任何格父格的非根河道格 ----
+    parents = {(py, px) for _, _, py, px in attach_log if py >= 0}
+    sources = [(y, x) for y, x, py, px in attach_log
+               if py >= 0 and (y, x) not in parents]
+    stats["num_sources"] = len(sources)
+
+    # ---- 2. 源头注入量 ----
+    land = world.land_mask
+    elev = world.elevation.astype(np.float64)
+    # 湿度等级由代表值还原（0=干旱 1=半干旱 2=半湿润 3=全湿润）
+    _hv = np.asarray(_HUMIDITY_LEVEL_VALUES, dtype=np.float64)
+    _mids = (_hv[:-1] + _hv[1:]) / 2.0
+    hum_lvl = np.digitize(world.humidity, _mids)
+
+    # 高山邻近加成：最近山体的距离与海拔（海拔归一化到全图山体最高值）
+    near_mtn = None
+    mtn = land & (elev >= float(mountain_min_elev))
+    if mountain_source_flow > 0 and mountain_radius > 0 and mtn.any():
+        dist_mtn, idx = distance_transform_edt(~mtn, return_indices=True)
+        near_mtn = (dist_mtn, elev[idx[0], idx[1]],
+                    max(float(elev[mtn].max()), 1e-9))
+
+    for y, x in sources:
+        q = float(source_flow)
+        if hum_lvl[y, x] >= 2:  # 半湿润/全湿润地区的源头
+            q += float(humid_source_flow)
+            stats["humid_sources"] += 1
+        if near_mtn is not None:
+            dist_mtn, mtn_elev, mtn_ref = near_mtn
+            d = dist_mtn[y, x]
+            if d <= float(mountain_radius):
+                q += (float(mountain_source_flow)
+                      * (1.0 - d / float(mountain_radius))
+                      * (mtn_elev[y, x] / mtn_ref))
+                stats["mountain_sources"] += 1
+        discharge[y, x] = q
+
+    # ---- 3. 向下游累加（离入海口越近，水流量越大）----
+    for y, x, py, px in reversed(attach_log):
+        if py >= 0:
+            discharge[py, px] += discharge[y, x]
+
+    world.river_discharge[...] = discharge.astype(np.float32)
+    rmask = world.river_mask
+    if rmask.any():
+        stats["max_discharge"] = float(discharge[rmask].max())
+        stats["mean_discharge"] = float(discharge[rmask].mean())
+    return stats
 
 
 # ============================================================
@@ -1555,7 +1744,10 @@ def generate_hydrology_erosion(
     mountain_sea_boost: float = 1.0,       # 靠海一侧湿度增益（等级，0~3 连续）
     mountain_inland_boost: float = 0.3,    # 靠内陆一侧湿度增益（等级，应小于靠海侧）
     # ── 湿度：西风带 ──
-    westerly_reach_frac: float = 0.6,      # 西风影响范围（占图宽比例）：默认 0.5 = 影响半张地图
+    westerly_reach_frac: float = 0.6,      # 西风椭圆风场东西向半轴（占图宽比例）：向东衰减慢，默认 0.6
+    westerly_source_lat: float = 45.0,     # 西风源点纬度（°N，位于屏幕左缘）：默认 45 = 西风带中部
+    westerly_lat_ratio: float = 0.5,       # 北向半轴与东西向半轴之比（0~1）：越小北向衰减越快
+    westerly_south_ratio: float = 0.8,     # 南向半轴与东西向半轴之比（0~1）：默认大于北向，使西风南缘探入地中海带西部
     westerly_boost: float = 2.0,           # 西风最大额外湿度（等级）：使西风带西半侧升至全湿润
     westerly_falloff: float = 0.4,         # 西风衰减指数：<1 衰减放缓（湿润深入内陆），>1 衰减加剧；调强度主力参数
     mediterranean_westerly_boost: float = 0.4,  # 地中海带"小西风"最大额外湿度（等级）：与西风带同一风场但力度较小
@@ -1572,8 +1764,9 @@ def generate_hydrology_erosion(
     # ── 湿度：相邻等级过渡 ──
     humidity_transition_band: float = 4.0,  # 每级过渡带宽度（格）：相邻区域等级差强制 ≤1，缺失中间等级自动补带
     # ── 河流生成 ──
-    num_outlets: int = 60,          # 河口（根节点）数量：均分模式（默认）为确切目标数；指定 outlet_coast_spacing 时为上限
-    outlet_coast_spacing: Optional[float] = None,  # 河口沿河岸弧长间距（格）：None/0=按全海岸线总长均分 num_outlets 个河口；数值=间距至少该值且总数不超 num_outlets
+    num_outlets: int = 60,          # 河口（根节点）数量：随机撒点模式（默认）为确切目标数；指定 outlet_coast_spacing 时为上限
+    outlet_coast_spacing: Optional[float] = None,  # 河口沿河岸间距（格）：None/0=直接随机撒 num_outlets 个；数值=以原始海岸格数近似弧长、按该间距推出撒点数（不超 num_outlets）
+    outlet_coast_band: float = 3.0, # 宽海岸带宽度（格）：海岸线向陆地一侧膨胀该格数形成宽带，河口在带内随机撒点；≤0=仅在 1 格宽海岸线上撒
     # 河流算法："sca"（空间殖民算法简化版，默认：纯吸引方向生长、河道平直，
     # 反平行间距控制生成叶脉状分叉，河流终止于山脉边缘）
     # 或 "dla"（旧版扩散限制聚集，河道呈灌木状分叉）
@@ -1596,6 +1789,8 @@ def generate_hydrology_erosion(
     sca_rift_attraction: int = 200,  # 裂谷加撒吸引点数：在裂谷（plate_boundaries == 5）像素上额外均匀撒点，裂谷有较大机会成为河道；0=关闭
     sca_max_iterations: Optional[int] = None,  # 迭代上限（性能兜底）：None=按 3.5×max(宽,高) 自动；正常在吸引点耗尽或停滞时提前结束
     sca_node_retries: int = 5,       # 节点连续受阻多少轮后退出生长前沿（卡死末梢放弃，吸引点让给其他分支）
+    sca_young_influence: float = 2.0,  # 幼龄豁免：刚离河口 sca_young_steps 步内的河段，吸引点影响半径 = d_i × 本系数（≤1 关闭）
+    sca_young_steps: int = 8,        # 幼龄豁免的步数窗口：离河口多少步以内算幼龄（≤0 关闭）
     # ── DLA 河流（river_algorithm="dla" 时生效）──
     spawn_radius: float = 25.0,
     spawn_elevation_bias: float = 2.0,
@@ -1605,6 +1800,11 @@ def generate_hydrology_erosion(
     max_walk_steps: int = 400,
     coastal_buffer: int = 0,
     pool_rebuild_interval: int = 256,
+    # ── 河流水流量 ──
+    river_source_flow: float = 1.0,          # 每个源头的基础水流量：源头越多，下游水流量越大
+    river_humid_source_flow: float = 1.0,    # 湿润地区（半湿润/全湿润）源头的额外水流量
+    river_mountain_source_flow: float = 2.0, # 临近高山源头的最大额外水流量（随距离衰减、随山体海拔缩放）
+    river_mountain_radius: float = 20.0,     # 源头的高山邻近半径（格）：≤0 关闭高山加成
     # ── 水力侵蚀 ──
     enable_hydraulic_erosion: bool = True,
     hydraulic_K: float = 0.02,
@@ -1658,14 +1858,19 @@ def generate_hydrology_erosion(
         雨影效应——海拔 ≥ mountain_min_elev 的陆地计为山体，
         半径内靠海一侧湿度增益 mountain_sea_boost、靠内陆一侧
         mountain_inland_boost（均为连续等级单位 0~3）。
-    westerly_reach_frac / westerly_boost / westerly_falloff /
+    westerly_reach_frac / westerly_source_lat / westerly_lat_ratio /
+    westerly_south_ratio / westerly_boost / westerly_falloff /
     mediterranean_westerly_boost / westerlies_min_level :
-        西风（含地中海"小西风"）按到地图西缘距离衰减的额外
-        湿度；默认影响半张地图（0.5×图宽）。falloff 为衰减
-        指数，<1 衰减放缓、西风更强，是调西风强度的主力参数；
-        地中海带受同一风场但力度较小（小西风 boost）；
-        westerlies_min_level 为西风带最低湿度等级（默认
-        1 = 半干旱）。
+        西风（含地中海"小西风"）：自屏幕左缘纬度 westerly_source_lat
+        （默认 45°N，西风带中部）的源点向东南北三个方向扩散的
+        拉长椭圆风场的额外湿度。reach_frac 为东西向半轴占图宽
+        比例（向东衰减慢，默认 0.6）；纵向分南北两个半轴——
+        westerly_lat_ratio 为北向半轴之比（默认 0.5），
+        westerly_south_ratio 为南向半轴之比（默认 0.8，更大，
+        使西风南缘探入地中海带西部）。falloff 为衰减指数，<1
+        衰减放缓、西风更强，是调西风强度的主力参数；地中海带
+        受同一风场但力度较小（小西风 boost）；westerlies_min_level
+        为西风带最低湿度等级（默认 1 = 半干旱）。
     wind_edge_zone_width / wind_edge_noise_prob / wind_edge_iterations :
         西风与季风截止线的元胞自动机扰动（共用）：扰动范围 /
         噪点概率 / 平滑迭代；扰动后截止线呈有机曲线而非直线，
@@ -1680,12 +1885,14 @@ def generate_hydrology_erosion(
         湿度等级（默认 1 = 半干旱，季风区内不存在干旱）。
     humidity_transition_band : float
         相邻湿度区域等级差强制 ≤1 时每级过渡带的宽度（格）。
-    num_outlets / outlet_coast_spacing :
-        河口（根节点）控制。先检查整条海岸线（连通域分解 +
-        贪心沿程走查成 1D 弧长），再沿海岸弧长均匀撒点。
-        均分模式（outlet_coast_spacing 为 None/0，默认）：
-        间距 = 全海岸线总长 / num_outlets；间距模式（数值）：
-        间距至少为该值且总数不超 num_outlets。
+    num_outlets / outlet_coast_spacing / outlet_coast_band :
+        河口（根节点）控制。与水相邻的海岸像素向外膨胀
+        outlet_coast_band 格形成几格宽的宽海岸带（限陆侧），
+        河口在带内无放回随机撒点——点够多时总有落在理想位置
+        的候选，每段海岸按面积等概率获得根节点。均分模式
+        （outlet_coast_spacing 为 None/0，默认）：撒 num_outlets
+        个；间距模式（数值）：以原始海岸格数近似弧长，按该间距
+        推出撒点数（不超 num_outlets）。
     river_algorithm : str
         河流生成算法："sca"（空间殖民算法，默认）或 "dla"（旧版）。
     sca_num_attraction / sca_d_i / sca_d_k / sca_D :
@@ -1717,6 +1924,20 @@ def generate_hydrology_erosion(
         裂谷加撒吸引点数：在裂谷（plate_boundaries == 5，
         板块离散形成的构造低地）像素上额外均匀撒点，
         裂谷有较大机会成为河道；0 = 关闭。
+    sca_young_influence / sca_young_steps :
+        幼龄豁免：离河口 sca_young_steps 步以内的河段，吸引点
+        影响半径放宽为 d_i × sca_young_influence——刚发育几步的
+        河流尚在近岸无点带内，普通半径捕获不到吸引点会夭折；
+        放宽后撑过无点带。≤1 或 ≤0 = 关闭。
+    river_source_flow / river_humid_source_flow /
+    river_mountain_source_flow / river_mountain_radius :
+        河流水流量（river_discharge 图层）：每个源头注入
+        river_source_flow 基础流量（源头越多下游越大）；位于半湿润/
+        全湿润地区的源头额外 +river_humid_source_flow；源头
+        river_mountain_radius 格内有山体（海拔 ≥ mountain_min_elev）
+        时再额外 +river_mountain_source_flow × 距离衰减 × 山体海拔
+        归一化（海拔影响：越近、山越高加成越大）。水流量向下游
+        累加，每个河道格有自己的水流量值。
     spawn_radius / spawn_elevation_bias : float
         投放池范围（流域范围）与高海拔投放偏好指数。
         注意：spawn_radius 不宜超过约 sqrt(max_walk_steps)（扩散可达距离），
@@ -1775,6 +1996,7 @@ def generate_hydrology_erosion(
         mountain_min_elev, mountain_effect_radius,
         mountain_sea_boost, mountain_inland_boost,
         westerly_reach_frac, westerly_boost, westerly_falloff,
+        westerly_source_lat, westerly_lat_ratio, westerly_south_ratio,
         mediterranean_westerly_boost, westerlies_min_level,
         monsoon_reach_frac, monsoon_boost,
         monsoon_falloff, monsoon_min_level,
@@ -1791,16 +2013,17 @@ def generate_hydrology_erosion(
             # （间距 ÷ 步长 ≈ 路径格数，+6 余量供弯道使用）
             sca_spacing_exempt = int(sca_min_channel_spacing / max(sca_D, 1e-6)) + 6
         river_stats, attach_log = _grow_rivers_sca(
-            world, num_outlets, outlet_coast_spacing,
+            world, num_outlets, outlet_coast_spacing, outlet_coast_band,
             sca_num_attraction, sca_d_i, sca_d_k, sca_D, sca_L_min,
             sca_max_step_drop, sca_min_channel_spacing, sca_parallel_angle,
             sca_spacing_exempt, sca_mountain_max_distance, sca_mountain_buffer,
             sca_coast_avoid, sca_arid_attraction, sca_semi_arid_attraction,
-            sca_rift_attraction, sca_node_retries, sca_max_iterations,
+            sca_rift_attraction, sca_node_retries,
+            sca_young_influence, sca_young_steps, sca_max_iterations,
         )
     elif river_algorithm == "dla":
         river_stats, attach_log = _grow_rivers_dla(
-            world, num_outlets, outlet_coast_spacing,
+            world, num_outlets, outlet_coast_spacing, outlet_coast_band,
             spawn_radius,
             spawn_elevation_bias, walk_elevation_bias, max_river_neighbors,
             max_particles, max_walk_steps, coastal_buffer, pool_rebuild_interval,
@@ -1808,6 +2031,13 @@ def generate_hydrology_erosion(
     else:
         raise ValueError(f"未知河流算法: {river_algorithm!r}（可选 'sca' / 'dla'）")
     report["rivers"] = river_stats
+
+    # ---------- 5b. 河流水流量（源头注入，向下游累加）----------
+    report["river_discharge"] = _compute_river_discharge(
+        world, attach_log, mountain_min_elev,
+        river_source_flow, river_humid_source_flow,
+        river_mountain_source_flow, river_mountain_radius,
+    )
 
     # ---------- 6~8. 侵蚀（在 float64 工作副本上累计）----------
     elev0 = world.elevation.astype(np.float64)

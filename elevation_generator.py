@@ -69,7 +69,12 @@ elevation_generator.py
         明显小于山脉抬升）。裂谷与山脉共用"细中线 + DLA 梳齿"
         范式：直线中线（Voronoi 边缘本身）栅格化后，沿中线扫掠
         自同一烘焙纹理按 rift_tooth_max_length 裁短的窄梳齿——
-        裂谷比山脉窄，不规则宽度由梳齿纹理天然提供；深度沿线
+        裂谷比山脉窄，不规则宽度由梳齿纹理天然提供；裂谷底部另
+        叠加梭子形（两头尖中间宽）盆地：沿中线逐样本盖宽度包络
+        sin(πt)×rift_basin_half_width 的圆盘盆底（真正末端收尖、
+        交汇端保持全宽），盆底并入中线深度场，梳齿自盆缘向外
+        衰减构成盆坡——裂谷因而是盆地而非一条等宽沟壑，
+        rift_basin_half_width = 0 时关闭（保持沟壑）；深度沿线
         渐变：真正末端在 rift_end_taper 内渐隐至 0，交汇端点在
         rift_junction_blend 内向各裂谷深度的均值过渡（短裂谷重叠
         区的处理与山脊对称），梳齿深度自最近中线格按距离衰减，
@@ -77,9 +82,18 @@ elevation_generator.py
         ridge_speed / ridge_elevation 取负值（负身份/负速度/负深度）
         与山脊正值区分，plate_boundaries 编码 5 = 裂谷，供未来
         水文等模块使用
+    11e. 高原（碰撞高原 + 地盾高原）：巨大碰撞（closing ≥
+        plateau_collision_speed）山脉仰冲一侧的板块以 plateau_prob
+        概率整体抬升为碰撞高原，提升量与山脉同形对数映射
+        （基准 + 系数×ln(1+超出速度)，封顶）；不沿海的大陆板块
+        另以 shield_plateau_prob 概率成为地盾高原（固定提升）。
+        两种高原的抬升场统一经高斯平滑（plateau_edge_sigma）
+        抹圆边缘，模拟高原到平原的侵蚀过渡（抬升场非负，
+        旁边的平原只会被高斯尾部轻微抬起，不会被压低）
     12. 海拔场合成：海陆基准场（大陆板块 +continent_base / 海洋板块
         −ocean_depth，板块边界处高斯平滑过渡）+ 山脊抬升场
-        （距离倒数对数衰减，最大值核）− 裂谷下陷场 + 背景噪声；
+        （距离倒数对数衰减，最大值核）− 裂谷下陷场 + 高原抬升场
+        + 背景噪声；
         海岸山脉不再被压入水下，
         其齿间谷地低于海平面时自然形成峡湾状溺谷海岸
     13. 海陆掩膜（elevation > sea_level），结果写回 World
@@ -92,7 +106,8 @@ elevation_generator.py
     micro_plate_velocity / macro_plate_velocity，
     以及自定义图层 ridge_mask（含裂谷格）/ ridge_line_mask
     （仅碰撞山脊中线本体，不含梳齿与裂谷）/ ridge_elevation
-    （负值 = 裂谷深度）/ velocity_x / velocity_y。
+    （负值 = 裂谷深度）/ plateau_mask / plateau_uplift /
+    velocity_x / velocity_y。
 
 移除的旧参数：high_prob / low_prob / adjacent_boost_prob /
     high_height / low_height（随机选边与固定两档高度已被
@@ -784,13 +799,22 @@ def _rasterize_rift_lines(
     end_taper: float = 10.0,
     junction_blend: float = 10.0,
     junction_snap: float = 1.5,
+    basin_half_width: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    把选中的离散边界栅格化为裂谷中线下陷场（1 格宽细线）。
+    把选中的离散边界栅格化为裂谷中线下陷场（1 格宽细线 +
+    可选梭子形盆地底）。
 
-    裂谷与山脉共用同一套"细中线 + DLA 梳齿贴印"范式：本函数只
+    裂谷与山脉共用同一套"细中线 + DLA 梳齿贴印"范式：本函数
     栅格化裂谷中线（直线，不扰动），不规则的宽度与纹理由后续
     的窄梳齿贴印提供，不再使用宽度噪声与地堑剖面。
+
+    梭子形盆地底（basin_half_width > 0 时）：裂谷不是一条等宽
+    沟壑，而是一个盆地——沿中线逐样本盖半径随弧长变化的圆盘，
+    宽度包络 env = sin(π·t_eff)：真正末端收尖（t_eff → 0/1）、
+    交汇端保持全宽（t_eff 固定 0.5），裂谷中部最宽，即"两头尖
+    中间宽"的梭子形。盆底并入中线深度场（取最大深度，身份/
+    速度同步），后续梳齿自盆地边缘向外衰减，构成自然的盆坡。
 
     深度沿裂谷线渐变（与山脊末端渐隐对称）：
     - 真正末端（端点不与其他裂谷共点）在 end_taper 格内以
@@ -878,6 +902,33 @@ def _rasterize_rift_lines(
                 depth_field[y, x] = dep_s[i]
                 id_field[y, x] = -k                   # 裂谷身份为负
                 speed_field[y, x] = np.float32(-divergence)  # 裂谷速度为负
+        # ---- 梭子形盆地底：沿中线按纺锤宽度包络逐样本盖圆盘 ----
+        # env = sin(π·t_eff)：真正末端收窄成尖、交汇端保持全宽，
+        # 裂谷中部最宽；盆底并入中线深度场（取最大深度），梳齿
+        # 自盆缘向外衰减构成盆坡
+        if basin_half_width > 0:
+            a_t = 0.0 if is_true_end[k - 1, 0] else 0.5
+            b_t = 1.0 if is_true_end[k - 1, 1] else 0.5
+            env = np.sin(math.pi * (a_t + (b_t - a_t) * t_arr))
+            for i in range(n_samp):
+                r = float(basin_half_width) * float(env[i])
+                if r < 0.5 or dep_s[i] <= 0:
+                    continue
+                ri = int(math.ceil(r))
+                gx0 = max(0, int(round(px[i])) - ri)
+                gx1 = min(width, int(round(px[i])) + ri + 1)
+                gy0 = max(0, int(round(py[i])) - ri)
+                gy1 = min(height, int(round(py[i])) + ri + 1)
+                mxv, myv = np.meshgrid(np.arange(gx0, gx1),
+                                       np.arange(gy0, gy1))
+                disc = ((mxv - px[i]) ** 2 + (myv - py[i]) ** 2) <= r * r
+                dpatch = depth_field[gy0:gy1, gx0:gx1]
+                upd = disc & (dep_s[i] > dpatch)
+                if not upd.any():
+                    continue
+                dpatch[upd] = dep_s[i]
+                id_field[gy0:gy1, gx0:gx1][upd] = -k
+                speed_field[gy0:gy1, gx0:gx1][upd] = np.float32(-divergence)
     return depth_field, id_field, speed_field
 
 
@@ -1728,6 +1779,121 @@ def _compute_ridge_uplift_field(
 
 
 # ============================================================
+# 功能函数：高原抬升场（碰撞高原 + 地盾高原，高斯平滑边缘）
+# ============================================================
+def _compute_plateau_uplift_field(
+    valid_edges: List,
+    points: List[Tuple[float, float]],
+    total_velocity: np.ndarray,
+    is_ocean: np.ndarray,
+    micro_plates: np.ndarray,
+    rng: np.random.Generator,
+    plateau_prob: float,
+    plateau_collision_speed: float,
+    plateau_base_height: float,
+    plateau_uplift_scale: float,
+    plateau_max_height: float,
+    shield_plateau_prob: float,
+    shield_plateau_height: float,
+    edge_sigma: float,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    高原抬升场，返回 (uplift_field, plateau_mask, stats)。
+
+    两类高原（均以整个小板块为单位整体抬升）：
+    1. 碰撞高原：相撞速度 closing ≥ plateau_collision_speed 的
+       "巨大碰撞"分界线，其仰冲一侧的板块（洋-陆边界取陆侧板块，
+       纯陆-陆取 +d̂ 指向的 p2 侧——与山脊撞击方向/次生山脊平移
+       方向一致）以 plateau_prob 的概率整体抬升为高原。提升量
+       与山脉同形的对数映射：
+           uplift = plateau_base_height
+                  + plateau_uplift_scale × ln(1 + closing − 阈值)
+           （封顶 plateau_max_height；同板块有多条合格边缘时
+           取最大值）
+    2. 地盾高原：不沿海（不邻接任何海洋板块）的大陆板块以
+       shield_plateau_prob 的概率成为高原，提升量固定
+       shield_plateau_height（模拟古老稳定地块的整体抬升）。
+
+    边缘柔化（两种高原共用）：高原若是整板块硬台阶边缘会很
+    锐利，故对抬升场做一次高斯平滑（σ = edge_sigma）——台阶
+    被抹成平缓的坡，模拟高原到平原的侵蚀过渡。平滑只作用于
+    非负的抬升场：旁边的平原至多被高斯尾部轻微抬起，绝不会
+    被压低。edge_sigma ≤ 0 时关闭（高原为硬边）。
+    """
+    h, w = micro_plates.shape
+    stats: Dict[str, Any] = {
+        "collision_plateaus": 0,
+        "shield_plateaus": 0,
+        "plateau_cells": 0,
+        "uplift_max": 0.0,
+    }
+    empty = (np.zeros((h, w), dtype=np.float64),
+             np.zeros((h, w), dtype=bool))
+    plateau_uplift: Dict[int, float] = {}
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(points)
+
+    # ---- 1. 碰撞高原：巨大碰撞分界线仰冲一侧的板块按概率抬升 ----
+    for _rv, _clipped, _btype, (p1, p2) in valid_edges:
+        d = pts[p2] - pts[p1]
+        dn = math.hypot(float(d[0]), float(d[1]))
+        if dn < 1e-9:
+            continue
+        d = d / dn
+        closing = float((total_velocity[p1] - total_velocity[p2]) @ d)
+        if closing < plateau_collision_speed:
+            continue
+        o1, o2 = bool(is_ocean[p1]), bool(is_ocean[p2])
+        if o1 and o2:
+            continue  # 洋-洋碰撞不造高原
+        # 仰冲一侧（撞击方向指向的板块）：洋-陆取陆侧，纯陆-陆取 p2
+        pid = (p2 if o1 else p1) if (o1 != o2) else p2
+        if rng.random() >= plateau_prob:
+            continue
+        up = min(
+            plateau_base_height
+            + plateau_uplift_scale * math.log1p(closing - plateau_collision_speed),
+            plateau_max_height,
+        )
+        if up > plateau_uplift.get(pid, 0.0):
+            plateau_uplift[pid] = up
+    stats["collision_plateaus"] = len(plateau_uplift)
+
+    # ---- 2. 地盾高原：不沿海的大陆板块按概率抬升 ----
+    if shield_plateau_prob > 0 and shield_plateau_height > 0:
+        has_ocean_nb = np.zeros(n, dtype=bool)
+        for _rv, _c, _bt, (p1, p2) in valid_edges:
+            if bool(is_ocean[p1]) != bool(is_ocean[p2]):
+                has_ocean_nb[p1] = has_ocean_nb[p2] = True
+        for pid in range(n):
+            if is_ocean[pid] or has_ocean_nb[pid] or pid in plateau_uplift:
+                continue
+            if rng.random() < shield_plateau_prob:
+                plateau_uplift[pid] = float(shield_plateau_height)
+        stats["shield_plateaus"] = (len(plateau_uplift)
+                                    - stats["collision_plateaus"])
+
+    if not plateau_uplift:
+        return empty[0], empty[1], stats
+
+    # ---- 3. 板块整体抬升 + 高斯平滑边缘 ----
+    lut = np.zeros(n, dtype=np.float64)
+    for pid, up in plateau_uplift.items():
+        lut[pid] = up
+    plateau_mask = lut[micro_plates] > 0
+
+    uplift_field = lut[micro_plates]
+    if edge_sigma > 0:
+        # 高斯平滑把板块边界的硬台阶抹成缓坡（高原→平原的侵蚀
+        # 过渡）；抬升场非负，平原只会被高斯尾部轻微抬起
+        uplift_field = gaussian_filter(
+            uplift_field, sigma=float(edge_sigma), mode="nearest")
+    stats["plateau_cells"] = int(plateau_mask.sum())
+    stats["uplift_max"] = float(uplift_field.max()) if uplift_field.size else 0.0
+    return uplift_field, plateau_mask, stats
+
+
+# ============================================================
 # 功能函数：背景柏林噪声场（向量化）
 # ============================================================
 def _compute_background_field(
@@ -1791,6 +1957,7 @@ def generate_mountain_terrain(
     max_rift_depth: float = 80.0,        # 裂谷深度封顶(米)；应明显小于山脉抬升
     rift_end_taper: float = 10.0,        # 裂谷真正末端的深度渐隐长度(格) [0~80]
     rift_junction_blend: float = 10.0,   # 交汇裂谷的深度过渡长度(格) [0~60]
+    rift_basin_half_width: float = 2.0,  # 裂谷盆地底部最大半宽(格)：梭子形（两头尖中间宽）盆底；0=保持等宽沟壑 [0~30]
     # ── 山脊曲线与栅格化 ──
     amplitude: float = 5.0,             # 山脊曲线摆动幅度(格)；↑边缘更弯 [0~40]
     frequency: float = 3.0,              # 曲线/高度一维噪声频率；↑变化更密 [1~10]
@@ -1805,10 +1972,19 @@ def generate_mountain_terrain(
     tooth_max_length: float = 20.0,      # 山脊梳齿最大长度(格) [5~60]
     rift_tooth_max_length: float = 10.0, # 裂谷梳齿最大长度(格)；宜小于山脊梳齿 [3~40]
     # ── 次生山脊（强碰撞的平行第二皱褶/前陆褶皱带）──
-    secondary_ridge_threshold: Optional[float] = 1.0,  # 次生山脊相撞速度阈值：超过才生成，应明显高于碰撞阈值；None=关闭
+    secondary_ridge_threshold: Optional[float] = 1,  # 次生山脊相撞速度阈值：超过才生成，应明显高于碰撞阈值；None=关闭
     secondary_ridge_offset: float = 15.0,       # 次生山脊沿撞击方向的平移距离(格)；小于梳齿长度则两脊梳齿少量重叠 [8~30]
-    secondary_ridge_end_shrink: float = 12.0,   # 次生山脊两端各缩短的弧长(格) [0~40]
+    secondary_ridge_end_shrink: float = 3.0,   # 次生山脊两端各缩短的弧长(格) [0~40]
     secondary_ridge_height_scale: float = 0.45, # 次生山脊高度倍率（低矮的第二皱褶）[0.2~0.7]
+    # ── 高原（碰撞高原 + 地盾高原，高斯平滑边缘）──
+    plateau_prob: float = 0.5,           # 巨大碰撞山脉旁的板块整体抬升为高原的概率 [0~1]
+    plateau_collision_speed: float = 2.0,# “巨大碰撞”相撞速度阈值：超过它的山脉旁板块才候选为高原（应高于碰撞阈值）
+    plateau_base_height: float = 40.0,   # 碰撞高原基准提升(米)
+    plateau_uplift_scale: float = 20.0,  # 对数提升系数(米)：提升 = 基准 + 系数×ln(1+超出速度)，与山脉同形
+    plateau_max_height: float = 400.0,   # 碰撞高原提升封顶(米)
+    shield_plateau_prob: float = 0.15,   # 不沿海大陆板块成为地盾高原的概率 [0~1]
+    shield_plateau_height: float = 60.0, # 地盾高原提升(米)
+    plateau_edge_sigma: float = 4.0,     # 高原边缘高斯平滑σ(格)：把板块硬台阶抹成缓坡（高原→平原侵蚀过渡）；≤0=硬边 [0~15]
     # 梳齿纹理解码自 ring_dla_stamps.py（ring_dla_baker.py 离线烘焙
     # 的硬编码数据，毫秒级，零DLA成本）；烘焙文件缺失时按固定的
     # 兜底配置现场生长（一次性，模块级缓存，不占世界随机流）
@@ -1921,6 +2097,12 @@ def generate_mountain_terrain(
         重叠的短裂谷：两端皆交汇时中点分开各自渐变、仅一端交汇时
         整条自身成为渐变、两端皆真末端时成拱形。梳齿深度自最近
         中线格按距离衰减，自动跟随渐变。
+    rift_basin_half_width : float
+        裂谷盆地底部的最大半宽（格）：裂谷不是一条等宽沟壑而是
+        一个盆地——沿中线逐样本盖宽度包络 sin(πt)×半宽 的圆盘
+        盆底，两头尖（真正末端收尖、交汇端保持全宽）中间宽，
+        盆底并入中线深度场，梳齿自盆缘向外衰减构成盆坡。
+        0 = 关闭（保持沟壑）。
     ridge_influence / tooth_influence / tooth_decay / tooth_max_length : float
         原初山脊抬升半径 / 梳齿抬升半径 / 梳齿每格海拔(深度)衰减 /
         山脊梳齿最大长度。裂谷梳齿复用同一衰减率 tooth_decay。
@@ -1945,6 +2127,23 @@ def generate_mountain_terrain(
         （None=关闭）、沿撞击方向平移距离（格，小于梳齿长度则
         两脊梳齿少量重叠）、两端各缩短弧长（格）、高度倍率。
         次生山脊不位于板块分界线上，与主山脊共用梳齿贴印通道。
+    plateau_prob / plateau_collision_speed / plateau_base_height /
+    plateau_uplift_scale / plateau_max_height :
+        碰撞高原：相撞速度 ≥ plateau_collision_speed 的"巨大碰撞"
+        山脉，其仰冲一侧的板块（洋-陆边界取陆侧，纯陆-陆取撞击
+        方向指向的一侧）以 plateau_prob 概率整体抬升为高原；
+        提升量与山脉同形对数映射：plateau_base_height +
+        plateau_uplift_scale × ln(1 + 超出速度)，封顶
+        plateau_max_height。
+    shield_plateau_prob / shield_plateau_height :
+        地盾高原：不沿海（不邻接任何海洋板块）的大陆板块以
+        shield_plateau_prob 概率整体抬升 shield_plateau_height 米，
+        模拟古老稳定地块。
+    plateau_edge_sigma : float
+        高原边缘的高斯平滑 σ（格）：把整板块抬升的硬台阶抹成
+        缓坡，模拟高原到平原的侵蚀过渡；平滑作用于非负抬升场，
+        旁边的平原只会被高斯尾部轻微抬起，不会被压低。
+        ≤0 = 硬边。
     sea_level : float
         海平面海拔。elevation > sea_level 为陆地，反之为水域。
 
@@ -2111,6 +2310,7 @@ def generate_mountain_terrain(
     rift_primary_d, rift_primary_id, rift_primary_speed = _rasterize_rift_lines(
         rift_lines, width, height,
         end_taper=rift_end_taper, junction_blend=rift_junction_blend,
+        basin_half_width=rift_basin_half_width,
     )
     rift_primary_mask = rift_primary_d > 0
     # 沿裂谷中线扫掠窄梳齿（比山脊梳齿短的纹理），宽度/纹理同山脉
@@ -2144,7 +2344,19 @@ def generate_mountain_terrain(
     world.ridge_id[...] = ridge_id
     world.ridge_speed[...] = ridge_speed
 
-    # ---------- 12. 海拔场合成（海陆基准场 + 山脊抬升 − 裂谷下陷 + 背景噪声）----------
+    # ---------- 11e. 高原：碰撞高原 + 地盾高原（高斯平滑边缘）----------
+    # 巨大碰撞山脉仰冲一侧的板块按 plateau_prob 概率整体抬升（对数
+    # 映射同山脉）；不沿海的大陆板块另按 shield_plateau_prob 概率
+    # 成为地盾高原。抬升场经高斯平滑抹圆边缘（抬升场非负，旁边
+    # 的平原只会被高斯尾部轻微抬起，不会被压低）
+    plateau_field, plateau_mask, plateau_stats = _compute_plateau_uplift_field(
+        valid_edges, points, v_total, is_ocean, micro_plates, world.rng,
+        plateau_prob, plateau_collision_speed,
+        plateau_base_height, plateau_uplift_scale, plateau_max_height,
+        shield_plateau_prob, shield_plateau_height, plateau_edge_sigma,
+    )
+
+    # ---------- 12. 海拔场合成（海陆基准场 + 山脊抬升 − 裂谷下陷 + 高原抬升 + 背景噪声）----------
     uplift_field = _compute_ridge_uplift_field(
         ridge_elev, primary_mask, ridge_influence, tooth_influence,
     )
@@ -2154,7 +2366,8 @@ def generate_mountain_terrain(
     bg_field = _compute_background_field(
         width, height, bg_amp, bg_freq, bg_octaves, bg_lacunarity, world.rng,
     )
-    elevation = domain_base + uplift_field + bg_field - rift_depth_field
+    elevation = (domain_base + uplift_field + bg_field
+                 - rift_depth_field + plateau_field)
 
     # ---------- 13. 海陆掩膜、图层写回与报告 ----------
     world.elevation[...] = elevation.astype(np.float32)
@@ -2172,6 +2385,13 @@ def generate_mountain_terrain(
     if world.get_layer("ridge_elevation") is None:
         world.add_layer("ridge_elevation", np.float32, 0.0)
     world.get_layer("ridge_elevation")[...] = ridge_elev.astype(np.float32)
+    # 高原图层：掩膜 + 抬升量（碰撞高原与地盾高原的并集）
+    if world.get_layer("plateau_mask") is None:
+        world.add_layer("plateau_mask", np.bool_, False)
+    world.get_layer("plateau_mask")[...] = plateau_mask
+    if world.get_layer("plateau_uplift") is None:
+        world.add_layer("plateau_uplift", np.float32, 0.0)
+    world.get_layer("plateau_uplift")[...] = plateau_field.astype(np.float32)
 
     # 像素级速度场（小板块总速度按像素展开，供可视化）
     v_field = v_total[micro_plates]  # (h, w, 2)
@@ -2197,6 +2417,7 @@ def generate_mountain_terrain(
             "total_speed_max": float(v_total_speed.max()),
         },
         "collisions": collision_stats,
+        "plateaus": plateau_stats,
         "rifts": rift_stats,
         "rift_cells": int((rift_id_field < 0).sum()),
         "coast_chamfers": n_coast_chamfer,
