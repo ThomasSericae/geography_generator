@@ -1915,6 +1915,136 @@ def _compute_background_field(
     bg_val = bg_perlin.octave_noise(nx, ny, bg_octaves, bg_lacunarity, 0.5)
     return ((bg_val + 1.0) * 0.5 * bg_amp).astype(np.float32)
 
+def _compute_slip_speed(p1: int, p2: int, points, v_total) -> float:
+    """计算两个板块之间的侧滑速度（切向分量大小）。"""
+    d = np.asarray(points[p2]) - np.asarray(points[p1])
+    dn = np.linalg.norm(d)
+    if dn < 1e-9:
+        return 0.0
+    d = d / dn
+    v_rel = v_total[p1] - v_total[p2]
+    closing = np.dot(v_rel, d)
+    sliding_vec = v_rel - closing * d
+    return float(np.linalg.norm(sliding_vec))
+
+
+def _apply_slip_parallel_segments(
+    ridge_curves: List[Tuple],
+    valid_edges: List,
+    points: List[Tuple[float, float]],
+    v_total: np.ndarray,
+    slip_threshold: float,
+    angle_slope: float,
+    angle_offset: float,
+    length_scale: float,
+    length_offset: float,
+    length_max: float,
+) -> List[Tuple]:
+    """
+    将侧滑速度超过阈值的山脊替换为一组平行短线。
+
+    每条短线中点位于原山脊曲线（含噪声扰动）上，长度由对数函数
+    决定，与山脊线切线的夹角由线性函数决定（角度取锐角，方向固定
+    为切线左侧）。短线彼此平行（相对于各自局部的切线旋转相同角度，
+    由于山脊线弯曲，全局并非严格平行，但视觉上近似平行）。
+    """
+    # 建立从原始端点（clipped）到板块编号的映射
+    edge_map = {}
+    for _rv, clipped, _btype, (p1, p2) in valid_edges:
+        # 用四舍五入后的端点作为键，提高浮点容错
+        key = (tuple(np.round(clipped[0], 6)), tuple(np.round(clipped[1], 6)))
+        edge_map[key] = (p1, p2)
+
+    new_curves = []
+    for rc in ridge_curves:
+        curve_points, ridge_h, edge_offset, closing, btype, raw_start, raw_end, shift_dir = rc
+        # 找到对应的板块编号
+        key = (tuple(np.round(raw_start, 6)), tuple(np.round(raw_end, 6)))
+        if key not in edge_map:
+            # 未匹配（理论上不会发生），保留原样
+            new_curves.append(rc)
+            continue
+        p1, p2 = edge_map[key]
+        sliding = _compute_slip_speed(p1, p2, points, v_total)
+        if sliding < slip_threshold:
+            new_curves.append(rc)
+            continue
+
+        # 将原曲线转为 numpy 数组并计算弧长
+        pts = np.asarray(curve_points, dtype=np.float64)
+        if len(pts) < 2:
+            new_curves.append(rc)
+            continue
+        seg = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+        s_cum = np.concatenate(([0.0], np.cumsum(seg)))
+        total = s_cum[-1]
+        if total < 2.0:
+            new_curves.append(rc)
+            continue
+
+        # 计算短线长度（对数函数）
+        length = min(length_offset + length_scale * math.log1p(sliding - slip_threshold),
+                     length_max)
+        length = max(length, 2.0)  # 最小 2 格
+
+        # 计算短线与切线的夹角（度 → 弧度），固定为锐角，方向取切线左侧
+        angle_deg = angle_offset + angle_slope * (sliding - slip_threshold)
+        angle_rad = math.radians(abs(angle_deg))  # 取锐角
+
+        # 确定短线数量：沿弧长每隔 length 放置一个，至少 2 个
+        num_segments = max(2, int(round(total / length)))
+        # 在弧长上均匀取点作为短线中心
+        sample_s = np.linspace(0.0, total, num_segments)
+        # 插值得到中心点坐标
+        cx = np.interp(sample_s, s_cum, pts[:, 0])
+        cy = np.interp(sample_s, s_cum, pts[:, 1])
+
+        # 计算每个中心点处的切线方向（数值微分）
+        # 使用中心差分（端点用单侧）
+        tx = np.gradient(cx)
+        ty = np.gradient(cy)
+        tnorm = np.hypot(tx, ty)
+        tnorm[tnorm < 1e-9] = 1.0
+        tx /= tnorm
+        ty /= tnorm
+
+        # 计算垂直于切线左侧的单位向量（即 (-ty, tx)）
+        nx = -ty
+        ny = tx
+
+        # 短线方向 = 切线旋转 angle_rad（左侧为正，即逆时针）
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        dx = tx * cos_a - ty * sin_a   # 旋转公式，但需要确认方向
+        dy = tx * sin_a + ty * cos_a
+        # 实际上应该用旋转矩阵作用于切线向量，得到与切线夹角为 angle_rad 的向量
+        # 这里我们让短线方向在切线左侧 angle_rad 处，即 nx,ny 旋转 (90° - angle_rad)
+        # 更简单：直接使用 nx,ny 旋转 (90° - angle_rad) 得到方向
+        rot_angle = math.pi / 2 - angle_rad
+        cos_r = math.cos(rot_angle)
+        sin_r = math.sin(rot_angle)
+        dirx = nx * cos_r - ny * sin_r
+        diry = nx * sin_r + ny * cos_r
+        # 归一化
+        dnorm = np.hypot(dirx, diry)
+        dirx /= dnorm
+        diry /= dnorm
+
+        half_len = length / 2.0
+        for i in range(num_segments):
+            p0x = cx[i] - dirx[i] * half_len
+            p0y = cy[i] - diry[i] * half_len
+            p1x = cx[i] + dirx[i] * half_len
+            p1y = cy[i] + diry[i] * half_len
+            # 构建新的 ridge_curve 条目
+            new_pts = [(float(p0x), float(p0y)), (float(p1x), float(p1y))]
+            # edge_offset 沿用原值（影响噪声，但噪声只用于高度调制，短线很短影响不大）
+            new_rc = (new_pts, ridge_h, edge_offset, closing, btype,
+                      (float(p0x), float(p0y)), (float(p1x), float(p1y)),
+                      shift_dir)
+            new_curves.append(new_rc)
+
+    return new_curves
 
 # ============================================================
 # 主要进程函数：山脉地形生成（板块速度碰撞版）
@@ -1985,6 +2115,13 @@ def generate_mountain_terrain(
     shield_plateau_prob: float = 0.15,   # 不沿海大陆板块成为地盾高原的概率 [0~1]
     shield_plateau_height: float = 60.0, # 地盾高原提升(米)
     plateau_edge_sigma: float = 4.0,     # 高原边缘高斯平滑σ(格)：把板块硬台阶抹成缓坡（高原→平原侵蚀过渡）；≤0=硬边 [0~15]
+    # ── 侧滑平行短线（板块侧滑导致的山脊分段）──
+    slip_threshold: float = float(5),       # 侧滑速度阈值；超过则替换为平行短线，inf=关闭
+    slip_angle_slope: float = 20.0,             # 角度线性函数斜率（度/速度单位）
+    slip_angle_offset: float = 10.0,            # 角度截距（度）
+    slip_length_scale: float = 15.0,            # 长度对数缩放系数（格）
+    slip_length_offset: float = 5.0,            # 长度偏移（格）
+    slip_length_max: float = 80.0,              # 短线最大长度（格）
     # 梳齿纹理解码自 ring_dla_stamps.py（ring_dla_baker.py 离线烘焙
     # 的硬编码数据，毫秒级，零DLA成本）；烘焙文件缺失时按固定的
     # 兜底配置现场生长（一次性，模块级缓存，不占世界随机流）
@@ -2233,7 +2370,17 @@ def generate_mountain_terrain(
         perlin, amplitude, frequency, octaves, lacunarity, min_edge_length,
         is_ocean, coastal_ridge_offset,
     )
-
+    # ---------- 侧滑平行短线变换（新增）----------
+    if slip_threshold is not None and slip_threshold < np.inf:
+        ridge_curves = _apply_slip_parallel_segments(
+            ridge_curves, valid_edges, points, v_total,
+            slip_threshold,
+            slip_angle_slope, slip_angle_offset,
+            slip_length_scale, slip_length_offset, slip_length_max,
+        )
+        collision_stats["slip_parallel_segments"] = len(
+            [rc for rc in ridge_curves if len(rc[0]) == 2 and rc[1] > 0]
+        )  # 粗略统计，实际可更精确
     # ---------- 10a. 尖角倒角：截断锐角交汇处，新增倒角短线 ----------
     # 夹角 < junction_chamfer_angle 的交汇过于锐利：两线在距交点
     # junction_chamfer_dist 处截断，新增连接两截点的短线，α 尖角
