@@ -632,6 +632,8 @@ class World:
         # 沉积厚度层：float32，本模块沉积作用造成的累计抬升量（米）。
         self._deposition_thickness: np.ndarray = np.zeros((self.height, self.width), dtype=np.float32)
 
+        self._micro_plate_centers: np.ndarray = np.zeros((0, 2), dtype=np.float64)
+
         # ---------- 扩展图层 ----------
         # 允许用户或后续模块动态添加自定义图层
         self._layers: Dict[str, np.ndarray] = {}
@@ -707,6 +709,16 @@ class World:
     # ------------------------------------------------------------------
     # 板块级数据（长度随板块数变化，可整块赋值）
     # ------------------------------------------------------------------
+
+    # 【新增】属性访问器
+    @property
+    def micro_plate_centers(self) -> np.ndarray:
+        """小板块种子点坐标 (n_micro, 2)，float64。"""
+        return self._micro_plate_centers
+
+    @micro_plate_centers.setter
+    def micro_plate_centers(self, value: np.ndarray) -> None:
+        self._micro_plate_centers = np.asarray(value, dtype=np.float64)
 
     @property
     def micro_to_macro(self) -> np.ndarray:
@@ -877,6 +889,7 @@ class World:
         self._micro_plate_is_ocean = np.zeros(0, dtype=np.bool_)
         self._micro_plate_velocity = np.zeros((0, 2), dtype=np.float64)
         self._macro_plate_velocity = np.zeros((0, 2), dtype=np.float64)
+        self._micro_plate_centers = np.zeros((0, 2), dtype=np.float64)
 
     def reset_hydro_layers(self) -> None:
         """将水文与侵蚀图层重置为默认值。"""
@@ -920,6 +933,7 @@ class World:
         new_world._river_strength[...] = self._river_strength
         new_world._deposition_type[...] = self._deposition_type
         new_world._deposition_thickness[...] = self._deposition_thickness
+        new_world._micro_plate_centers = self._micro_plate_centers.copy()
         for name, arr in self._layers.items():
             new_world.add_layer(name, arr.dtype, 0)
             new_world._layers[name][...] = arr
